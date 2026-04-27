@@ -10,12 +10,12 @@
  *   4. Update: adjust internal scoring — gradually, never abruptly
  *   5. Reflect: store a structured reflection for future decisions
  *
- * Anti-overfit guards:
- *   - EMA alpha = 0.08 (slow — resists noise)
- *   - Minimum MIN_SAMPLE outcomes before any weight moves
- *   - Per-update weight delta capped at MAX_DELTA
- *   - All weights bounded [WEIGHT_MIN, WEIGHT_MAX]
- *   - Reflections rolling-capped at MAX_REFLECTIONS
+ * Learning rules (non-negotiable):
+ *   1. Adjust confidence slowly   — EMA alpha 0.08, conf nudge capped at ±MAX_CONF_NUDGE
+ *   2. Ignore low-sample patterns — MIN_SAMPLE outcomes required before any weight moves
+ *   3. Do not chase recent wins   — streak guard halves alpha when last 3 outcomes cluster
+ *   4. Prefer stability           — per-update delta capped at MAX_DELTA; weights bounded
+ *   5. If uncertain → WAIT        — calibratedConfidence() returns raw when data is thin
  */
 
 "use strict";
@@ -31,8 +31,11 @@ const WEIGHTS_PATH     = path.join(__dirname, "weight-store.json");
 const REFLECTIONS_PATH = path.join(__dirname, "reflections.json");
 
 const EMA_ALPHA        = 0.08;   // slow — resists recent-outcome bias
-const MIN_SAMPLE       = 5;      // outcomes needed before weight moves
-const MAX_DELTA        = 0.05;   // max weight shift per update
+const MIN_SAMPLE       = 8;      // outcomes needed before ANY weight moves (rule 2)
+const MAX_DELTA        = 0.05;   // max weight shift per update (rule 4)
+const MAX_CONF_NUDGE   = 0.08;   // max confidence adjustment from calibration (rule 1)
+const STREAK_WINDOW    = 3;      // consecutive same-direction outcomes → streak guard (rule 3)
+const STREAK_ALPHA     = 0.04;   // halved alpha during a streak
 const WEIGHT_MIN       = 0.05;
 const WEIGHT_MAX       = 0.60;
 const MAX_REFLECTIONS  = 200;
@@ -70,7 +73,7 @@ let _reflections = load(REFLECTIONS_PATH, []);
 function _defaultWeights() {
   return {
     // Win-rate EMA per pattern+regime combo — key: "pattern__regime"
-    // { ema_win_rate, ema_return_7d, n }
+    // { ema_win_rate, ema_return_7d, n, recent: bool[] (last STREAK_WINDOW) }
     pattern_regime: {},
 
     // Lift contributed by each binary factor (above base win rate)
@@ -222,15 +225,27 @@ function _learn(signal, compared) {
 
   const prKey = `${signal.pattern}__${signal.regime}`;
 
-  // 1. Pattern × regime win rate
+  // 1. Pattern × regime win rate — with streak guard (rule 3)
   const pr = _weights.pattern_regime[prKey] ||
-    (_weights.pattern_regime[prKey] = { ema_win_rate: null, ema_return_7d: null, n: 0 });
+    (_weights.pattern_regime[prKey] = { ema_win_rate: null, ema_return_7d: null, n: 0, recent: [] });
   pr.n += 1;
+
+  // Track recent outcomes (rolling window of STREAK_WINDOW)
+  if (!pr.recent) pr.recent = [];
+  pr.recent.push(win ? 1 : 0);
+  if (pr.recent.length > STREAK_WINDOW) pr.recent.shift();
+
+  // Streak guard: if all recent outcomes are identical, use dampened alpha
+  const streaking = pr.recent.length === STREAK_WINDOW &&
+    pr.recent.every((v) => v === pr.recent[0]);
+  const effectiveAlpha = streaking ? STREAK_ALPHA : EMA_ALPHA;
+
   if (pr.n >= MIN_SAMPLE) {
     const prev_wr = pr.ema_win_rate;
-    pr.ema_win_rate   = ema(pr.ema_win_rate,   win ? 1 : 0);
-    pr.ema_return_7d  = ema(pr.ema_return_7d,  return_7d ?? 0);
+    pr.ema_win_rate  = ema(pr.ema_win_rate,  win ? 1 : 0, effectiveAlpha);
+    pr.ema_return_7d = ema(pr.ema_return_7d, return_7d ?? 0, effectiveAlpha);
     deltas[`pattern_regime.${prKey}.ema_win_rate`] = _delta(prev_wr, pr.ema_win_rate);
+    if (streaking) deltas[`pattern_regime.${prKey}.streak_guard`] = true;
   }
 
   // 2. Factor lift (Tier A wallet)
@@ -467,9 +482,72 @@ function intelligence() {
   };
 }
 
+/**
+ * Apply learned calibration to a raw confidence score.
+ *
+ * Rules enforced:
+ *   1. Returns raw unchanged when pattern data is thin (< MIN_SAMPLE) → WAIT bias
+ *   2. Nudge is bounded by MAX_CONF_NUDGE — no sudden jumps
+ *   3. Calibration bucket check adds a second, independent correction
+ *   4. Streak guard is already baked into the weight it reads from
+ *
+ * @param {number} raw      Engine's raw confidence (0–1)
+ * @param {string} pattern  e.g. "accumulation"
+ * @param {string} regime   e.g. "range"
+ * @returns {{ confidence: number, adjusted: bool, reason: string }}
+ */
+function calibratedConfidence(raw, pattern, regime) {
+  let calibrated = raw;
+  const notes    = [];
+
+  // ── Pattern × regime historical win rate ─────────────────────────── //
+  const prKey = `${pattern}__${regime}`;
+  const pr    = _weights.pattern_regime[prKey];
+
+  if (!pr || pr.n < MIN_SAMPLE || pr.ema_win_rate == null) {
+    // Rule 2 & 5: not enough data — do not adjust, prefer WAIT
+    return {
+      confidence: raw,
+      adjusted:   false,
+      reason:     `Insufficient history for ${pattern}/${regime} (n=${pr?.n ?? 0} < ${MIN_SAMPLE}) — using raw confidence`,
+    };
+  }
+
+  // Rule 1: nudge slowly toward learned win rate
+  const prNudge = clamp((pr.ema_win_rate - raw) * EMA_ALPHA, -MAX_CONF_NUDGE, MAX_CONF_NUDGE);
+  if (Math.abs(prNudge) > 0.001) {
+    calibrated += prNudge;
+    notes.push(`pattern/${regime} win rate ${(pr.ema_win_rate * 100).toFixed(1)}% nudge ${prNudge > 0 ? "+" : ""}${(prNudge).toFixed(3)}`);
+  }
+
+  // ── Calibration bucket cross-check ───────────────────────────────── //
+  const bucket = _calibBucket(raw);
+  const cal    = _weights.calibration[bucket];
+
+  if (cal && cal.n >= MIN_SAMPLE && cal.actual_win_rate != null) {
+    const calNudge = clamp((cal.actual_win_rate - calibrated) * EMA_ALPHA, -MAX_CONF_NUDGE, MAX_CONF_NUDGE);
+    if (Math.abs(calNudge) > 0.001) {
+      calibrated += calNudge;
+      notes.push(`bucket [${bucket}] actual ${(cal.actual_win_rate * 100).toFixed(1)}% nudge ${calNudge > 0 ? "+" : ""}${(calNudge).toFixed(3)}`);
+    }
+  }
+
+  calibrated = clamp(+calibrated.toFixed(4), 0.40, 0.99);
+  const adjusted = Math.abs(calibrated - raw) > 0.001;
+
+  return {
+    confidence: calibrated,
+    adjusted,
+    reason: adjusted
+      ? notes.join("; ")
+      : "calibration within tolerance — no adjustment",
+  };
+}
+
 module.exports = {
   register,
   resolve,
+  calibratedConfidence,
   pending,
   allSignals,
   weights,

@@ -177,14 +177,27 @@ function assetAnalysisReply(ticker, messageContext = "") {
     confidence = Math.min(confidence, 0.52);
   }
 
+  // Apply learned calibration — slow nudge only; returns raw when data is thin
+  const cal = feedback.calibratedConfidence(confidence, detectedPattern, mktRegime);
+  if (cal.adjusted) {
+    confidence = cal.confidence;
+    // If calibration pushes us below alert threshold, reinforce WAIT
+    if (confidence < 0.75 && decision !== "WAIT") decision = "WAIT";
+  }
+
   const bullets = p.factors.map((f) => `• ${f}`).join("\n");
 
   // ── Regime note ─────────────────────────────────────────────────── //
   const regimeLabel = mktRegime.replace(/_/g, " ");
+  const calibLine   = cal.adjusted
+    ? `\nCalibration: adjusted → ${cal.confidence.toFixed(2)} (${cal.reason})`
+    : `\nCalibration: no adjustment (${cal.reason})`;
+
   const regimeLine  =
     `\nRegime   : ${regimeLabel} (conf ${regimeConf.toFixed(2)}, source: ${regimeSource})` +
     `\nPattern  : ${detectedPattern}` +
-    `\nValidation: ${validation.valid ? "✓ PASS" : "✗ REJECT"} — ${validation.reason}`;
+    `\nValidation: ${validation.valid ? "✓ PASS" : "✗ REJECT"} — ${validation.reason}` +
+    calibLine;
 
   // ── Wallet intel ─────────────────────────────────────────────────── //
   const tierA  = wallets.tierA();
