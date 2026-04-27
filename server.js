@@ -14,6 +14,7 @@ const fs      = require("fs");
 const path    = require("path");
 const wallets = require("./wallet-tracker");
 const regime  = require("./regime-validator");
+const alerts  = require("./alert-engine");
 
 const PORT   = process.env.PORT   || 3001;
 const ORIGIN = process.env.CORS_ORIGIN || "http://localhost:3000";
@@ -187,18 +188,41 @@ function assetAnalysisReply(ticker, messageContext = "") {
   // ── Wallet intel ─────────────────────────────────────────────────── //
   const tierA  = wallets.tierA();
   const active = tierA.filter((w) => w.best_regime != null);
+  const avgWinRate = tierA.length
+    ? tierA.reduce((s, w) => s + w.win_rate, 0) / tierA.length
+    : 0;
   const walletLine = tierA.length === 0
     ? "\nWallet Intel: No Tier A wallets established yet (< 10 observations each)."
     : `\nWallet Intel: ${tierA.length} Tier A wallet(s) tracked.` +
-      ` Avg win rate: ${(tierA.reduce((s, w) => s + w.win_rate, 0) / tierA.length * 100).toFixed(1)}%.` +
+      ` Avg win rate: ${(avgWinRate * 100).toFixed(1)}%.` +
       (active.length ? ` Best regime: ${active[0].best_regime}.` : "");
+
+  // ── Alert engine evaluation ───────────────────────────────────────── //
+  const alertResult = alerts.evaluate({
+    asset:          ticker,
+    decision,
+    confidence,
+    entry_zone:     "–",      // offline profiles don't have price zones
+    invalidation:   "–",
+    targets:        [],
+    pattern:        detectedPattern,
+    regime:         mktRegime,
+    regime_valid:   validation.valid,
+    tier_a_count:   tierA.length,
+    wallet_win_rate: avgWinRate,
+    has_volume:     false,
+  });
+  const alertLine = alertResult.issued
+    ? `\nAlert    : ISSUED — ${alertResult.alert.message}`
+    : `\nAlert    : not issued (${alertResult.reason ?? "gates not met"})`;
 
   return (
     `Summary:\n${p.summary}\n\n` +
     `Key Factors:\n${bullets}\n\n` +
     `Decision: ${decision} (confidence ${confidence.toFixed(2)})` +
     regimeLine +
-    walletLine
+    walletLine +
+    alertLine
   );
 }
 
@@ -413,7 +437,11 @@ const server = http.createServer((req, res) => {
   if (req.method === "GET" && req.url === "/health") {
     runGuard().then((report) => {
       res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ ...report, wallets: wallets.summary() }));
+      res.end(JSON.stringify({
+        ...report,
+        wallets: wallets.summary(),
+        alerts:  alerts.today(),
+      }));
     });
     return;
   }
@@ -497,6 +525,37 @@ const server = http.createServer((req, res) => {
     const detectedPattern = null; // no message context here
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ asset, ...info }));
+    return;
+  }
+
+  // GET /alerts — today's confirmed alerts + quota
+  if (req.method === "GET" && req.url === "/alerts") {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify(alerts.today()));
+    return;
+  }
+
+  // POST /alerts/evaluate — external signal submission
+  //   body: { asset, decision, confidence, entry_zone?, invalidation?, targets?,
+  //           pattern?, regime?, regime_valid?, tier_a_count?, wallet_win_rate?,
+  //           has_volume?, extra_reason? }
+  if (req.method === "POST" && req.url === "/alerts/evaluate") {
+    let body = "";
+    req.on("data", (chunk) => (body += chunk));
+    req.on("end", () => {
+      try {
+        const candidate = JSON.parse(body || "{}");
+        if (!candidate.asset || !candidate.decision) {
+          throw new Error("asset and decision required");
+        }
+        const result = alerts.evaluate(candidate);
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify(result));
+      } catch (err) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: err.message }));
+      }
+    });
     return;
   }
 
