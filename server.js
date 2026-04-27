@@ -12,9 +12,10 @@
 const http    = require("http");
 const fs      = require("fs");
 const path    = require("path");
-const wallets = require("./wallet-tracker");
-const regime  = require("./regime-validator");
-const alerts  = require("./alert-engine");
+const wallets   = require("./wallet-tracker");
+const regime    = require("./regime-validator");
+const alerts    = require("./alert-engine");
+const feedback  = require("./feedback-loop");
 
 const PORT   = process.env.PORT   || 3001;
 const ORIGIN = process.env.CORS_ORIGIN || "http://localhost:3000";
@@ -212,6 +213,12 @@ function assetAnalysisReply(ticker, messageContext = "") {
     wallet_win_rate: avgWinRate,
     has_volume:     false,
   });
+
+  // Register issued alert with feedback loop so outcomes can be matched later
+  if (alertResult.issued) {
+    feedback.register(alertResult.alert, tierA.map((w) => w.address));
+  }
+
   const alertLine = alertResult.issued
     ? `\nAlert    : ISSUED — ${alertResult.alert.message}`
     : `\nAlert    : not issued (${alertResult.reason ?? "gates not met"})`;
@@ -439,8 +446,9 @@ const server = http.createServer((req, res) => {
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({
         ...report,
-        wallets: wallets.summary(),
-        alerts:  alerts.today(),
+        wallets:   wallets.summary(),
+        alerts:    alerts.today(),
+        feedback:  feedback.intelligence(),
       }));
     });
     return;
@@ -573,6 +581,58 @@ const server = http.createServer((req, res) => {
         res.end(JSON.stringify({ ok: true, asset: asset.toUpperCase(), regime: r }));
       } catch (err) {
         res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: err.message }));
+      }
+    });
+    return;
+  }
+
+  // GET /feedback/pending — signals awaiting outcome
+  if (req.method === "GET" && req.url === "/feedback/pending") {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify(feedback.pending()));
+    return;
+  }
+
+  // GET /feedback/stats — learned intelligence snapshot
+  if (req.method === "GET" && req.url === "/feedback/stats") {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify(feedback.intelligence()));
+    return;
+  }
+
+  // GET /feedback/reflections — recent structured reflections
+  if (req.method === "GET" && req.url.startsWith("/feedback/reflections")) {
+    const qs    = new URL(req.url, "http://x").searchParams;
+    const limit = parseInt(qs.get("limit") ?? "50", 10);
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify(feedback.reflections(limit)));
+    return;
+  }
+
+  // GET /feedback/all — full ledger (resolved + pending)
+  if (req.method === "GET" && req.url === "/feedback/all") {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify(feedback.allSignals()));
+    return;
+  }
+
+  // POST /feedback/:id — submit outcome for a registered signal
+  //   body: { entry_price, price_24h?, price_7d?, hit_target?, hit_invalidation?,
+  //           has_volume?, tier_a_count?, wallet_addresses? }
+  if (req.method === "POST" && req.url.startsWith("/feedback/")) {
+    const id = decodeURIComponent(req.url.slice("/feedback/".length));
+    let body = "";
+    req.on("data", (chunk) => (body += chunk));
+    req.on("end", () => {
+      try {
+        const outcome = JSON.parse(body || "{}");
+        const result  = feedback.resolve(id, outcome);
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify(result));
+      } catch (err) {
+        const status = err.message.includes("not found") ? 404 : 400;
+        res.writeHead(status, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ error: err.message }));
       }
     });
