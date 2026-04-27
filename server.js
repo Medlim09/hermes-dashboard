@@ -9,9 +9,10 @@
 //
 // Run: node server.js  (from hermes-dashboard/)
 
-const http = require("http");
-const fs   = require("fs");
-const path = require("path");
+const http    = require("http");
+const fs      = require("fs");
+const path    = require("path");
+const wallets = require("./wallet-tracker");
 
 const PORT   = process.env.PORT   || 3001;
 const ORIGIN = process.env.CORS_ORIGIN || "http://localhost:3000";
@@ -153,10 +154,24 @@ const DEFAULT_ASSET_PROFILE = {
 function assetAnalysisReply(ticker) {
   const p = ASSET_PROFILES[ticker] || DEFAULT_ASSET_PROFILE;
   const bullets = p.factors.map((f) => `• ${f}`).join("\n");
+
+  // Augment with live Tier A wallet signal if any tracked wallets favour this asset
+  const tierA = wallets.tierA();
+  const active = tierA.filter((w) => w.best_regime != null);
+  let walletNote = "";
+  if (tierA.length === 0) {
+    walletNote = "\nWallet Intel: No Tier A wallets established yet (< 10 observations each).";
+  } else {
+    walletNote = `\nWallet Intel: ${tierA.length} Tier A wallet(s) tracked.` +
+      ` Avg win rate: ${(tierA.reduce((s, w) => s + w.win_rate, 0) / tierA.length * 100).toFixed(1)}%.` +
+      (active.length ? ` Best regime across cohort: ${active[0].best_regime}.` : "");
+  }
+
   return (
     `Summary:\n${p.summary}\n\n` +
     `Key Factors:\n${bullets}\n\n` +
-    `Decision:\n${p.decision} (confidence ${p.confidence.toFixed(2)})`
+    `Decision:\n${p.decision} (confidence ${p.confidence.toFixed(2)})` +
+    walletNote
   );
 }
 
@@ -240,12 +255,17 @@ async function hermesReplyOffline(message) {
   }
 
   // General chat → 3-part concise reply
+  const summary = wallets.summary();
+  const walletLine = summary.tier_a_count > 0
+    ? `${summary.tier_a_count} Tier A wallet(s) active across ${summary.eligible_wallets} tracked.`
+    : `Wallet tracker online — building history (${summary.total_wallets} wallets observed, min ${summary.min_observations} signals required for tier).`;
+
   return chatReply(
     "Hermes is online and monitoring tracked assets.",
     [
       "No high-conviction setups in the current window.",
       "Smart-money flows neutral; macro calendar quiet.",
-      "5-check confluence not met for any watchlist asset.",
+      walletLine,
     ],
     "Standing by — ask about a specific asset or opportunity for a structured read.",
   );
@@ -310,7 +330,7 @@ function runGuard() {
 // ── HTTP plumbing ──────────────────────────────────────────────────── //
 function cors(res) {
   res.setHeader("Access-Control-Allow-Origin",  ORIGIN);
-  res.setHeader("Access-Control-Allow-Methods", "POST, GET, OPTIONS");
+  res.setHeader("Access-Control-Allow-Methods", "POST, GET, OPTIONS, DELETE");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
 }
 
@@ -325,7 +345,49 @@ const server = http.createServer((req, res) => {
   if (req.method === "GET" && req.url === "/health") {
     runGuard().then((report) => {
       res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify(report));
+      res.end(JSON.stringify({ ...report, wallets: wallets.summary() }));
+    });
+    return;
+  }
+
+  // GET /wallets — full Tier A roster + summary
+  if (req.method === "GET" && req.url === "/wallets") {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify(wallets.summary()));
+    return;
+  }
+
+  // GET /wallets/:address — single wallet stats
+  if (req.method === "GET" && req.url.startsWith("/wallets/")) {
+    const address = req.url.slice("/wallets/".length);
+    const s = wallets.stats(address);
+    if (!s) {
+      res.writeHead(404, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "wallet not found or insufficient observations" }));
+    } else {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ ...s, tier: wallets.tier(address) }));
+    }
+    return;
+  }
+
+  // POST /wallets/record — record a signal and optional outcome
+  //   body: { address, signal: { asset, type, regime }, outcome: { win, return_24h, return_7d, max_adverse } }
+  if (req.method === "POST" && req.url === "/wallets/record") {
+    let body = "";
+    req.on("data", (chunk) => (body += chunk));
+    req.on("end", () => {
+      try {
+        const { address, signal = {}, outcome = {} } = JSON.parse(body || "{}");
+        if (!address) throw new Error("address required");
+        wallets.record(address, signal, outcome);
+        const s = wallets.stats(address);
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: true, tier: wallets.tier(address), stats: s }));
+      } catch (err) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: err.message }));
+      }
     });
     return;
   }
