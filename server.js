@@ -13,6 +13,7 @@ const http    = require("http");
 const fs      = require("fs");
 const path    = require("path");
 const wallets = require("./wallet-tracker");
+const regime  = require("./regime-validator");
 
 const PORT   = process.env.PORT   || 3001;
 const ORIGIN = process.env.CORS_ORIGIN || "http://localhost:3000";
@@ -151,27 +152,53 @@ const DEFAULT_ASSET_PROFILE = {
   decision: "WAIT", confidence: 0.50,
 };
 
-function assetAnalysisReply(ticker) {
+function assetAnalysisReply(ticker, messageContext = "") {
   const p = ASSET_PROFILES[ticker] || DEFAULT_ASSET_PROFILE;
+
+  // ── Step 1: Regime identification ──────────────────────────────── //
+  const { regime: mktRegime, confidence: regimeConf, source: regimeSource } =
+    regime.getRegime(ticker, p.summary);
+
+  // ── Step 2: Pattern identification ─────────────────────────────── //
+  // Prefer explicit pattern from user message; fall back to profile intent
+  const detectedPattern = regime.detectPattern(messageContext) ||
+    (p.decision === "WAIT" ? "accumulation" : "breakout");
+
+  // ── Step 3: Validate pattern vs regime ─────────────────────────── //
+  const validation = regime.validate(detectedPattern, mktRegime);
+
+  // Regime mismatch → hard WAIT, cap confidence
+  let decision   = p.decision;
+  let confidence = p.confidence;
+  if (!validation.valid) {
+    decision   = "WAIT";
+    confidence = Math.min(confidence, 0.52);
+  }
+
   const bullets = p.factors.map((f) => `• ${f}`).join("\n");
 
-  // Augment with live Tier A wallet signal if any tracked wallets favour this asset
-  const tierA = wallets.tierA();
+  // ── Regime note ─────────────────────────────────────────────────── //
+  const regimeLabel = mktRegime.replace(/_/g, " ");
+  const regimeLine  =
+    `\nRegime   : ${regimeLabel} (conf ${regimeConf.toFixed(2)}, source: ${regimeSource})` +
+    `\nPattern  : ${detectedPattern}` +
+    `\nValidation: ${validation.valid ? "✓ PASS" : "✗ REJECT"} — ${validation.reason}`;
+
+  // ── Wallet intel ─────────────────────────────────────────────────── //
+  const tierA  = wallets.tierA();
   const active = tierA.filter((w) => w.best_regime != null);
-  let walletNote = "";
-  if (tierA.length === 0) {
-    walletNote = "\nWallet Intel: No Tier A wallets established yet (< 10 observations each).";
-  } else {
-    walletNote = `\nWallet Intel: ${tierA.length} Tier A wallet(s) tracked.` +
+  const walletLine = tierA.length === 0
+    ? "\nWallet Intel: No Tier A wallets established yet (< 10 observations each)."
+    : `\nWallet Intel: ${tierA.length} Tier A wallet(s) tracked.` +
       ` Avg win rate: ${(tierA.reduce((s, w) => s + w.win_rate, 0) / tierA.length * 100).toFixed(1)}%.` +
-      (active.length ? ` Best regime across cohort: ${active[0].best_regime}.` : "");
-  }
+      (active.length ? ` Best regime: ${active[0].best_regime}.` : "");
 
   return (
     `Summary:\n${p.summary}\n\n` +
     `Key Factors:\n${bullets}\n\n` +
-    `Decision:\n${p.decision} (confidence ${p.confidence.toFixed(2)})` +
-    walletNote
+    `Decision: ${decision} (confidence ${confidence.toFixed(2)})` +
+    regimeLine +
+    walletLine
   );
 }
 
@@ -233,24 +260,39 @@ async function hermesReplyOffline(message) {
   // Asset analysis — "what about SOL", "analyze ethereum", etc.
   const ticker = detectAsset(m);
   if (ticker) {
-    return assetAnalysisReply(ticker);
+    return assetAnalysisReply(ticker, m);
   }
 
-  // Signal / opportunity / trade intent → structured JSON
+  // Signal / opportunity / trade intent → regime-gated JSON
   if (SIGNAL_INTENT.test(m)) {
+    const detectedPattern = regime.detectPattern(m);
+    // No specific asset → use generic "range" as conservative default
+    const mktRegime   = "range";
+    const validation  = regime.validate(detectedPattern || "accumulation", mktRegime);
+    if (!validation.valid) {
+      return jsonReply(
+        "WAIT",
+        0.48,
+        `Signal rejected: ${validation.reason}`,
+      );
+    }
     return jsonReply(
       "WAIT",
       0.62,
-      "Market lacks strong directional bias; signals are mixed.",
+      "Market lacks strong directional bias; signals are mixed. All regime checks passed.",
     );
   }
 
-  // Market context query → structured JSON
+  // Market context query → include live regime snapshot
   if (MARKET_INTENT.test(m)) {
+    const knownRegimes = regime.allRegimes();
+    const regimeSummary = knownRegimes.length
+      ? knownRegimes.map((r) => `${r.asset}: ${r.regime.replace(/_/g, " ")}`).join(", ")
+      : "no regimes explicitly set — inference only";
     return jsonReply(
       "WAIT",
       0.55,
-      "Neutral regime, moderate volatility — no asymmetric edge right now.",
+      `Neutral macro context — no asymmetric edge. Regime snapshot: ${regimeSummary}.`,
     );
   }
 
@@ -273,11 +315,37 @@ async function hermesReplyOffline(message) {
 
 // ── Real LLM call ─────────────────────────────────────────────────── //
 async function hermesReplyLLM(message) {
+  // Inject regime + wallet context so Claude can apply the validation rules
+  const assetTicker    = detectAsset(message.toLowerCase());
+  const assetProfile   = assetTicker ? ASSET_PROFILES[assetTicker] : null;
+  const regimeInfo     = assetTicker
+    ? regime.getRegime(assetTicker, assetProfile?.summary ?? "")
+    : null;
+  const detectedPattern = regime.detectPattern(message);
+  const validation     = (regimeInfo && detectedPattern)
+    ? regime.validate(detectedPattern, regimeInfo.regime)
+    : null;
+  const walletSummary  = wallets.summary();
+
+  const contextBlock = [
+    `## Pre-Signal Context (injected by Hermes engine)`,
+    assetTicker  ? `Asset: ${assetTicker}` : null,
+    regimeInfo   ? `Regime: ${regimeInfo.regime.replace(/_/g, " ")} (conf ${regimeInfo.confidence.toFixed(2)}, ${regimeInfo.source})` : null,
+    detectedPattern ? `Detected pattern: ${detectedPattern}` : null,
+    validation   ? `Regime validation: ${validation.valid ? "PASS" : "REJECT"} — ${validation.reason}` : null,
+    `Tier A wallets: ${walletSummary.tier_a_count} (eligible: ${walletSummary.eligible_wallets})`,
+    validation && !validation.valid
+      ? `INSTRUCTION: Pattern-regime mismatch detected. You MUST return decision: WAIT unless the user explicitly provides reversal evidence that overrides the rejection.`
+      : null,
+  ].filter(Boolean).join("\n");
+
+  const augmentedMessage = `${contextBlock}\n\n## User Query\n${message}`;
+
   const res = await anthropic.messages.create({
     model:      MODEL,
     max_tokens: 1024,
     system:     SYSTEM_PROMPT,
-    messages:   [{ role: "user", content: message }],
+    messages:   [{ role: "user", content: augmentedMessage }],
   });
   const text = res.content
     .filter((b) => b.type === "text")
@@ -409,6 +477,44 @@ const server = http.createServer((req, res) => {
         console.error("[chat] error:", err);
         res.writeHead(500, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ error: String(err) }));
+      }
+    });
+    return;
+  }
+
+  // GET /regime — all explicitly set regimes
+  if (req.method === "GET" && req.url === "/regime") {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ regimes: regime.allRegimes() }));
+    return;
+  }
+
+  // GET /regime/:asset — regime for one asset (with heuristic fallback)
+  if (req.method === "GET" && req.url.startsWith("/regime/")) {
+    const asset = req.url.slice("/regime/".length).toUpperCase();
+    const profile = ASSET_PROFILES[asset];
+    const info = regime.getRegime(asset, profile?.summary ?? "");
+    const detectedPattern = null; // no message context here
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ asset, ...info }));
+    return;
+  }
+
+  // POST /regime — set regime explicitly
+  //   body: { asset, regime, confidence? }
+  if (req.method === "POST" && req.url === "/regime") {
+    let body = "";
+    req.on("data", (chunk) => (body += chunk));
+    req.on("end", () => {
+      try {
+        const { asset, regime: r, confidence } = JSON.parse(body || "{}");
+        if (!asset || !r) throw new Error("asset and regime required");
+        regime.setRegime(asset.toUpperCase(), r, confidence);
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: true, asset: asset.toUpperCase(), regime: r }));
+      } catch (err) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: err.message }));
       }
     });
     return;
