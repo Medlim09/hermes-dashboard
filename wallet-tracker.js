@@ -165,11 +165,18 @@ class WalletTracker {
     // Use EMA where available (more stable than raw mean for win_rate)
     const wr = w.ema_win_rate != null ? w.ema_win_rate : win_rate;
 
+    // Weights (must sum to 1.0):
+    //   wr         0.25 — EMA-smoothed win rate (trend-sensitive, recency-aware)
+    //   win_rate   0.20 — raw historical win rate (anchors EMA against drift)
+    //   ret_score  0.25 — normalised 7d return (outcome quality)
+    //   consistency 0.20 — return stability (lower vol = higher score)
+    //   sample_wt  0.10 — observation depth (saturates at 50)
     return clamp(
-      wr         * 0.35 +
-      ret_score  * 0.35 +
+      wr          * 0.25 +
+      win_rate    * 0.20 +
+      ret_score   * 0.25 +
       consistency * 0.20 +
-      sample_wt  * 0.10,
+      sample_wt   * 0.10,
       0, 1,
     );
   }
