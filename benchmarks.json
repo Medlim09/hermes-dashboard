@@ -1,0 +1,30 @@
+[
+  {
+    "win_rate": 0.62,
+    "false_positive_rate": 0.18,
+    "avg_return": 0.04,
+    "source": "manual",
+    "recorded_at": "2026-04-29T00:00:00.000Z",
+    "analysis": {
+      "verdict": "MONITOR",
+      "findings": [
+        {
+          "flag": "CALIBRATION_DRIFT",
+          "detail": "Gap 0.13 — approaching alert threshold. Monitor."
+        },
+        {
+          "flag": "FPR_ACCEPTABLE",
+          "detail": "0.18 within range"
+        },
+        {
+          "flag": "HEALTHY_RETURN",
+          "detail": "avg return 0.04 — positive expectancy confirmed"
+        }
+      ],
+      "actions": [
+        "Continue collecting signal outcomes — calibration will self-correct via EMA"
+      ],
+      "sample_note": "Sample size not provided — treat findings as directional."
+    }
+  }
+]

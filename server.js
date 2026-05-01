@@ -18,6 +18,102 @@ const alerts    = require("./alert-engine");
 const feedback  = require("./feedback-loop");
 const scanner   = require("./autonomous-scanner");
 
+// ── Benchmarks store ───────────────────────────────────────────────── //
+const BENCHMARKS_PATH = path.join(__dirname, "benchmarks.json");
+
+function loadBenchmarks() {
+  try {
+    if (fs.existsSync(BENCHMARKS_PATH))
+      return JSON.parse(fs.readFileSync(BENCHMARKS_PATH, "utf8"));
+  } catch { /* ignore */ }
+  return [];
+}
+
+function saveBenchmarks(data) {
+  try { fs.writeFileSync(BENCHMARKS_PATH, JSON.stringify(data, null, 2)); }
+  catch (e) { console.warn("[Benchmarks] save failed:", e.message); }
+}
+
+/**
+ * Analyse a performance snapshot against current system config.
+ * Never updates weights directly — only individual signal outcomes do that.
+ * Bulk stats are diagnostic; authority stays with resolve() calls.
+ */
+function analyseBenchmark(snap) {
+  const { win_rate, false_positive_rate, avg_return, n = null } = snap;
+
+  const CONF_GATE    = 0.75;   // current alert threshold
+  const calibGap     = CONF_GATE - win_rate;          // positive = overconfident
+  const CALIB_ALERT  = 0.15;
+  const fprTarget    = 0.15;
+
+  const findings = [];
+  const actions  = [];
+
+  // ── Calibration gap ─────────────────────────────────────────────── //
+  if (calibGap > CALIB_ALERT) {
+    findings.push({
+      flag: "OVERCONFIDENT",
+      detail: `Confidence gate ${CONF_GATE} → actual win rate ${win_rate} — gap ${(calibGap).toFixed(2)} exceeds ${CALIB_ALERT} threshold`,
+    });
+    actions.push(`Raise effective confidence threshold to ~${(CONF_GATE + calibGap * 0.5).toFixed(2)} or increase MIN_SAMPLE in feedback-loop`);
+  } else if (calibGap > 0.08) {
+    findings.push({
+      flag: "CALIBRATION_DRIFT",
+      detail: `Gap ${calibGap.toFixed(2)} — approaching alert threshold. Monitor.`,
+    });
+    actions.push("Continue collecting signal outcomes — calibration will self-correct via EMA");
+  } else if (calibGap <= 0) {
+    findings.push({
+      flag: "UNDERCONFIDENT",
+      detail: `Win rate ${win_rate} exceeds confidence gate ${CONF_GATE} — system is conservative`,
+    });
+    actions.push("System is leaving edge on the table. Consider lowering gate slightly once n > 30.");
+  } else {
+    findings.push({ flag: "CALIBRATED", detail: `Gap ${calibGap.toFixed(2)} within tolerance` });
+  }
+
+  // ── False positive rate ──────────────────────────────────────────── //
+  if (false_positive_rate > fprTarget + 0.05) {
+    findings.push({
+      flag: "HIGH_FPR",
+      detail: `False positive rate ${false_positive_rate} exceeds target ${fprTarget}`,
+    });
+    actions.push("Tighten: require volume confirmation on all breakout patterns; raise tier_a_count requirement to ≥2");
+  } else {
+    findings.push({ flag: "FPR_ACCEPTABLE", detail: `${false_positive_rate} within range` });
+  }
+
+  // ── Average return ───────────────────────────────────────────────── //
+  if (avg_return < 0) {
+    findings.push({ flag: "NEGATIVE_EXPECTANCY", detail: `avg return ${avg_return} — system losing money net` });
+    actions.push("STOP issuing alerts until regime validation is audited. Check loss_cluster insights.");
+  } else if (avg_return < 0.02) {
+    findings.push({ flag: "LOW_EXPECTANCY", detail: `avg return ${avg_return} — positive but thin` });
+    actions.push("Focus on higher time-frame setups; current entries may be too early or exits too tight");
+  } else {
+    findings.push({ flag: "HEALTHY_RETURN", detail: `avg return ${avg_return} — positive expectancy confirmed` });
+  }
+
+  // ── Sample size warning ──────────────────────────────────────────── //
+  const sampleNote = n !== null && n < 30
+    ? `⚠ Low sample (n=${n}) — findings are directional only. Weight conclusions after n≥30.`
+    : n !== null
+    ? `Sample size n=${n} — findings statistically meaningful.`
+    : "Sample size not provided — treat findings as directional.";
+
+  // ── Overall verdict ──────────────────────────────────────────────── //
+  const flags = findings.map((f) => f.flag);
+  const verdict =
+    flags.includes("NEGATIVE_EXPECTANCY") ? "HALT"    :
+    flags.includes("OVERCONFIDENT")       ? "TIGHTEN" :
+    flags.includes("HIGH_FPR")            ? "FILTER"  :
+    flags.includes("HEALTHY_RETURN") && flags.includes("CALIBRATED") ? "MAINTAIN" :
+    "MONITOR";
+
+  return { verdict, findings, actions, sample_note: sampleNote };
+}
+
 const PORT   = process.env.PORT   || 3001;
 const ORIGIN = process.env.CORS_ORIGIN || "http://localhost:3000";
 const MODEL  = process.env.HERMES_MODEL || "claude-opus-4-7";
@@ -599,6 +695,46 @@ const server = http.createServer((req, res) => {
         res.end(JSON.stringify({ error: err.message }));
       }
     });
+    return;
+  }
+
+  // POST /performance — ingest a performance snapshot; returns analysis
+  //   body: { win_rate, false_positive_rate, avg_return, n?, period?, source? }
+  if (req.method === "POST" && req.url === "/performance") {
+    let body = "";
+    req.on("data", (chunk) => (body += chunk));
+    req.on("end", () => {
+      try {
+        const snap = JSON.parse(body || "{}");
+        const { win_rate, false_positive_rate, avg_return } = snap;
+        if (win_rate == null || false_positive_rate == null || avg_return == null) {
+          throw new Error("win_rate, false_positive_rate, and avg_return are required");
+        }
+
+        const analysis  = analyseBenchmark(snap);
+        const benchmarks = loadBenchmarks();
+        const entry = { ...snap, recorded_at: new Date().toISOString(), analysis };
+        benchmarks.unshift(entry);
+        if (benchmarks.length > 200) benchmarks.length = 200;
+        saveBenchmarks(benchmarks);
+
+        console.log(`[Benchmarks] ${analysis.verdict} — win=${win_rate} fpr=${false_positive_rate} ret=${avg_return}`);
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify(entry));
+      } catch (err) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: err.message }));
+      }
+    });
+    return;
+  }
+
+  // GET /performance — all benchmark snapshots + latest analysis
+  if (req.method === "GET" && req.url === "/performance") {
+    const benchmarks = loadBenchmarks();
+    const latest     = benchmarks[0] ?? null;
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ total: benchmarks.length, latest, history: benchmarks }));
     return;
   }
 
