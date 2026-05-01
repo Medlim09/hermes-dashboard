@@ -16,6 +16,7 @@ const wallets   = require("./wallet-tracker");
 const regime    = require("./regime-validator");
 const alerts    = require("./alert-engine");
 const feedback  = require("./feedback-loop");
+const scanner   = require("./autonomous-scanner");
 
 const PORT   = process.env.PORT   || 3001;
 const ORIGIN = process.env.CORS_ORIGIN || "http://localhost:3000";
@@ -462,6 +463,7 @@ const server = http.createServer((req, res) => {
         wallets:   wallets.summary(),
         alerts:    alerts.today(),
         feedback:  feedback.intelligence(),
+        scanner:   scanner.status(),
       }));
     });
     return;
@@ -600,6 +602,22 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  // GET /scanner/status — scanner health, cycle count, next run
+  if (req.method === "GET" && req.url === "/scanner/status") {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify(scanner.status()));
+    return;
+  }
+
+  // GET /scanner/insights — recent anomaly log (?limit=N, default 50)
+  if (req.method === "GET" && req.url.startsWith("/scanner/insights")) {
+    const qs    = new URL(req.url, "http://x").searchParams;
+    const limit = parseInt(qs.get("limit") ?? "50", 10);
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify(scanner.insights(limit)));
+    return;
+  }
+
   // GET /feedback/pending — signals awaiting outcome
   if (req.method === "GET" && req.url === "/feedback/pending") {
     res.writeHead(200, { "Content-Type": "application/json" });
@@ -659,4 +677,5 @@ const server = http.createServer((req, res) => {
 server.listen(PORT, () => {
   console.log(`Hermes backend listening on http://localhost:${PORT}`);
   console.log(`CORS origin: ${ORIGIN}`);
+  scanner.start();
 });
