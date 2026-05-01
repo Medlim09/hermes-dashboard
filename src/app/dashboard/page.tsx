@@ -81,6 +81,35 @@ function Live({ active }: { active: boolean }) {
   );
 }
 
+// ── Backend URL config ────────────────────────────────────────────────── //
+function ApiConfig({ onSave }: { onSave: (url: string) => void }) {
+  const [val, setVal] = useState(
+    typeof window !== "undefined"
+      ? localStorage.getItem("hermes_api_url") ?? ""
+      : "",
+  );
+  return (
+    <form
+      onSubmit={(e) => { e.preventDefault(); localStorage.setItem("hermes_api_url", val); onSave(val); }}
+      className="flex gap-2"
+    >
+      <input
+        value={val}
+        onChange={(e) => setVal(e.target.value)}
+        placeholder="Backend URL (e.g. https://xxx.railway.app)"
+        className="flex-1 bg-zinc-800 border border-zinc-700 rounded px-3 py-1.5 text-sm
+                   text-zinc-200 placeholder-zinc-600 focus:outline-none focus:border-zinc-500"
+      />
+      <button
+        type="submit"
+        className="px-3 py-1.5 rounded bg-zinc-700 hover:bg-zinc-600 text-sm text-zinc-200 transition-colors"
+      >
+        Connect
+      </button>
+    </form>
+  );
+}
+
 // ── Main dashboard ────────────────────────────────────────────────────── //
 export default function Dashboard() {
   const [alerts,    setAlerts]    = useState<Awaited<ReturnType<typeof getAlerts>>   | null>(null);
@@ -92,6 +121,7 @@ export default function Dashboard() {
   const [regimes,   setRegimes]   = useState<RegimeInfo[]>([]);
   const [lastSync,  setLastSync]  = useState<Date | null>(null);
   const [error,     setError]     = useState<string | null>(null);
+  const [, forceRefresh] = useState(0);
 
   const refresh = useCallback(async () => {
     try {
@@ -142,7 +172,8 @@ export default function Dashboard() {
           </div>
         </div>
         <div className="flex items-center gap-3 text-xs text-zinc-500">
-          {error && <span className="text-red-400">backend unreachable</span>}
+          {error && <span className="text-red-400 font-medium">⚠ backend unreachable</span>}
+          {!error && lastSync && <span className="text-emerald-500">● connected</span>}
           {lastSync && <span>synced {ago(lastSync.toISOString())}</span>}
           <button
             onClick={refresh}
@@ -152,6 +183,16 @@ export default function Dashboard() {
           </button>
         </div>
       </header>
+
+      {/* Connection config — always visible so user can point to Railway backend */}
+      <div className="px-4 sm:px-6 py-3 border-b border-zinc-800 bg-zinc-900/50">
+        <ApiConfig onSave={() => { forceRefresh((n) => n + 1); }} />
+        {error && (
+          <p className="mt-2 text-xs text-red-400">
+            Could not reach backend. Paste your Railway backend URL above and click Connect.
+          </p>
+        )}
+      </div>
 
       <main className="flex-1 px-4 sm:px-6 py-6 grid gap-4
                        grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 auto-rows-min">

@@ -537,14 +537,20 @@ function runGuard() {
 }
 
 // ── HTTP plumbing ──────────────────────────────────────────────────── //
-function cors(res) {
-  res.setHeader("Access-Control-Allow-Origin",  ORIGIN);
+function cors(res, reqOrigin) {
+  // Allow the configured origin, or fall back to * so the Railway
+  // frontend (unknown URL at build time) is never blocked.
+  const allow = ORIGIN !== "http://localhost:3000"
+    ? ORIGIN          // explicit env var set — honour it
+    : (reqOrigin ?? "*");  // dev default — reflect or open
+  res.setHeader("Access-Control-Allow-Origin",  allow);
   res.setHeader("Access-Control-Allow-Methods", "POST, GET, OPTIONS, DELETE");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+  res.setHeader("Access-Control-Allow-Credentials", "false");
 }
 
 const server = http.createServer((req, res) => {
-  cors(res);
+  cors(res, req.headers.origin);
 
   if (req.method === "OPTIONS") {
     res.writeHead(204);
