@@ -1,5 +1,7 @@
 "use client";
 
+import Link from "next/link";
+import { usePathname } from "next/navigation";
 import ConversationList from "./ConversationList";
 
 interface Props {
@@ -7,6 +9,8 @@ interface Props {
 }
 
 export default function Sidebar({ onClose }: Props) {
+  const pathname = usePathname();
+
   return (
     <aside className="h-full w-64 max-w-[85vw] shrink-0 flex flex-col bg-zinc-950 border-r border-zinc-800">
       <div className="px-4 py-4 border-b border-zinc-800 flex items-start justify-between">
@@ -30,6 +34,27 @@ export default function Sidebar({ onClose }: Props) {
           </button>
         )}
       </div>
+
+      {/* Nav */}
+      <nav className="flex flex-col gap-0.5 px-2 py-2 border-b border-zinc-800">
+        {[
+          { href: "/",          label: "Chat",          icon: "💬" },
+          { href: "/dashboard", label: "Intelligence",  icon: "📡" },
+        ].map(({ href, label, icon }) => (
+          <Link
+            key={href}
+            href={href}
+            onClick={onClose}
+            className={`flex items-center gap-2.5 px-3 py-2 rounded-lg text-sm transition-colors
+              ${pathname === href
+                ? "bg-zinc-800 text-white"
+                : "text-zinc-400 hover:text-zinc-200 hover:bg-zinc-800/50"}`}
+          >
+            <span>{icon}</span>
+            <span>{label}</span>
+          </Link>
+        ))}
+      </nav>
 
       <ConversationList />
 
