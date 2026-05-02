@@ -147,8 +147,9 @@ if (process.env.ANTHROPIC_API_KEY) {
 //   • mixed signals / no edge    → WAIT
 //
 const GUARD_INTENT  = /\bbugs?\b|\berrors?\b|\bissues?\b|\bcrash\w*|\bhealth\b|\bguard\b|\bstatus\b|\bsystem\b|\bmonitor\w*|\bfail\w*|\bbroken\b|\bdown\b|\bstuck\b|\bproblems?\b/i;
-const SIGNAL_INTENT = /opportunit|\bsignal\b|\btrade\b|\bsetup\b|\bbuy\b|\bsell\b|\blong\b|\bshort\b|\bentry\b|\balpha\b|\bmove\b|\bedge\b/i;
-const MARKET_INTENT = /\b(market|price|chart|trend|macro|dominance)\b/i;
+const SIGNAL_INTENT = /opportunit|\bsignal\b|\btrade\b|\bsetup\b|\bbuy\b|\bsell\b|\blong\b|\bshort\b|\bentry\b|\balpha\b|\bmove\b|\bedge\b|\bposition\b|\bplay\b|\bbullish\b|\bbearish\b|\bbreakout\b|\baccumulat\b|\bwhat.*(do|think|say|see)\b|\bshould i\b|\bany (good|idea|pick|call|rec)/i;
+const MARKET_INTENT = /\b(market|price|chart|trend|macro|dominance|overview|outlook|summary|condition|sentiment|crypto|sector|rotation)\b/i;
+const HELP_INTENT   = /\bhello\b|\bhi\b|\bhey\b|\bhelp\b|\bwhat can\b|\bwhat do\b|\bwho are\b|\bintroduc\b|\bstart\b|\bguide\b|\bcommand\b|\bexample\b|\btest\b/i;
 
 // Known watchlist tickers + common aliases
 const ASSET_MAP = {
@@ -437,20 +438,34 @@ async function hermesReplyOffline(message) {
     );
   }
 
+  // Help / greeting → show capabilities
+  if (HELP_INTENT.test(m)) {
+    return chatReply(
+      "Hermes — market intelligence, online.",
+      [
+        "Ask about any asset: \"analyze SOL\", \"what about BTC?\", \"ETH outlook\"",
+        "Ask for signals: \"any opportunities?\", \"bullish setups?\", \"should I long ETH?\"",
+        "Ask about the market: \"market overview\", \"crypto sentiment\", \"macro outlook\"",
+        "Check system health: \"system status\", \"any issues?\", \"guard report\"",
+      ],
+      "Try: \"analyze SOL\" or \"any high-confidence setups right now?\"",
+    );
+  }
+
   // General chat → 3-part concise reply
   const summary = wallets.summary();
   const walletLine = summary.tier_a_count > 0
     ? `${summary.tier_a_count} Tier A wallet(s) active across ${summary.eligible_wallets} tracked.`
-    : `Wallet tracker online — building history (${summary.total_wallets} wallets observed, min ${summary.min_observations} signals required for tier).`;
+    : `Wallet tracker building history — ${summary.total_wallets} wallets observed, need ${summary.min_observations} signals each for tier classification.`;
 
   return chatReply(
-    "Hermes is online and monitoring tracked assets.",
+    "No specific asset or signal intent detected.",
     [
-      "No high-conviction setups in the current window.",
-      "Smart-money flows neutral; macro calendar quiet.",
+      "Try asking: \"analyze BTC\", \"any setups on SOL?\", or \"market overview\"",
+      "Supported assets: BTC, ETH, SOL, HYPE, PENDLE, TAO, SUI, BNB, XRP, ADA, AVAX, DOT, LINK",
       walletLine,
     ],
-    "Standing by — ask about a specific asset or opportunity for a structured read.",
+    "Type an asset name or ask about opportunities — Hermes will run a full structured read.",
   );
 }
 
